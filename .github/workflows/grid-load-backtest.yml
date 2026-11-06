@@ -1,0 +1,78 @@
+name: Grid load backtest
+
+on:
+  pull_request:
+    paths:
+      - 'grid_load_case/**'
+      - '.github/workflows/grid-load-backtest.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    name: Replay the IESO 2025 forecast
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: grid_load_case
+    steps:
+      - name: Check out the case
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: grid_load_case/requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Verify the official archive and run the backtest
+        run: |
+          printf '%s\n' '24d5dfabd8854b35acee4af186143d1835d7516c6e82f7ab8ae2797453d4d488  data/PUB_Demand_2025.csv' | sha256sum --check -
+          python grid_load_forecast.py --input data/PUB_Demand_2025.csv --out results
+
+      - name: Verify outputs and write the run summary
+        run: |
+          python - <<'PY'
+          import csv
+          import json
+          import os
+          from pathlib import Path
+
+          output = Path('results')
+          run = json.loads((output / 'run_info.json').read_text(encoding='utf-8'))
+          assert run['first_issue_invariance_check'] == 'PASS'
+          assert run['all_batch_availability_and_alignment_checks'] == 'PASS'
+          assert run['tested_target_days'] == 92
+          assert run['tested_hours'] == run['valid_common_hours'] == 2208
+          with (output / 'hourly_predictions.csv').open(encoding='utf-8-sig', newline='') as stream:
+              records = list(csv.DictReader(stream))
+          assert len(records) == 2208 * 5
+          with (output / 'error_metrics.csv').open(encoding='utf-8-sig', newline='') as stream:
+              scores = {row['method']: row for row in csv.DictReader(stream) if row['group'] == 'All'}
+          expected = {'d2_same_hour', 'd7_same_hour', 'ma24', 'stl', 'stl_ma_bias'}
+          assert set(scores) == expected
+
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write('## IESO 2025 forecast backtest\n\n')
+              summary.write('92 target days and 2,208 matched hours. Availability, alignment, and invariance checks passed.\n\n')
+              summary.write('| Method | MAE (MW) | RMSE (MW) |\n|---|---:|---:|\n')
+              for method, score in scores.items():
+                  summary.write(f"| {method} | {float(score['mae_mw']):.2f} | {float(score['rmse_mw']):.2f} |\n")
+          PY
+
+      - name: Upload forecast CSVs and figures
+        uses: actions/upload-artifact@v4
+        with:
+          name: grid-load-backtest-results
+          path: grid_load_case/results/
+          if-no-files-found: error
+          retention-days: 14
